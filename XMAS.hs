@@ -1,49 +1,61 @@
 {-# language TypeFamilies #-}
 module XMAS where
-import Data.Maybe
-import Data.List
+import Data.Maybe (fromJust, isJust)
+import Data.List (isPrefixOf)
+import Data.Tuple (swap)
 import Control.Comonad
 import Data.Distributive
 import Data.Functor.Compose
 import Data.Functor.Foldable
 
--- Infinite stream
+-- Conceptually, forward and backward streams are different,
+-- so here I separated them into two data types
 
+-- Infinite stream
 data Stream a = (:>) { headS :: a
                      , tailS :: Stream a }
     deriving Functor
 
 infixr 5 :>
 
--- Recursion scheme for streams
+-- All recursions will be done using recursion schemes
+
+-- Recursion schemes for streams
 data FPair a x = P a x
     deriving Functor
 
 type instance Base (Stream a) = FPair a
 
+-- We can use cata (fold)
 instance Recursive (Stream a) where
     project (a :> as) = P a as
 
+-- We can use ana (unfold)
 instance Corecursive (Stream a) where
     embed (P a as) = a :> as
 
+-- Zippy applicative
 instance Applicative Stream where
     pure :: a -> Stream a
-    pure = ana (\a -> P a a)
+    pure = ana (\a -> P a a) -- infinite stream of a's
     (<*>) :: Stream (a -> b) -> Stream a -> Stream b
-    (f :> fs) <*> (a :> as) = f a :> (fs <*> as)
+    fs <*> as = fmap (uncurry ($)) (zipS fs as)
+
+zipS :: Stream a -> Stream b -> Stream (a, b)
+zipS as bs = ana (\(as, bs) -> P (headS as, headS bs) 
+                                 (tailS as, tailS bs)) (as, bs)
 
 -- Stream is distributive over any functor
 instance Distributive Stream where
     distribute :: Functor f => f (Stream a) -> Stream (f a)
-    distribute stms = (headS <$> stms) :> distribute (tailS <$> stms)
+    distribute = ana (\fStms -> P (headS <$> fStms) (tailS <$> fStms))
 
 instance Show a => Show (Stream a) where
     show = show . take 4 . toInfList
 -- Backward infinite stream
 
-data BStream a = (:<) { tBStream :: BStream a
-                      , hBStream :: a }
+data BStream a = (:<) { tailBS :: BStream a
+                      , headBS :: a }
     deriving Functor
 
 infixl 5 :<
@@ -56,15 +68,21 @@ type instance Base (BStream a) = BPair a
 instance Corecursive (BStream a) where
     embed (BP as a) = as :< a
 
+-- Zippy applicative
 instance Applicative BStream where
     pure :: a -> BStream a
-    pure = ana (\a -> BP a a)
+    pure = ana (\a -> BP a a) -- infinite stream of a's
     (<*>) :: BStream (a -> b) -> BStream a -> BStream b
-    (fs :< f) <*> (as :< a) = (fs <*> as) :< f a
+    fs <*> as = fmap (uncurry ($)) (zipBS fs as)
+
+zipBS :: BStream a -> BStream b -> BStream (a, b)
+zipBS as bs = ana (\(as, bs) -> BP (tailBS as, tailBS bs)
+                                   (headBS as, headBS bs))(as, bs)
 
 instance Distributive BStream where
     distribute :: Functor f => f (BStream a) -> BStream (f a)
-    distribute stms = distribute (tBStream <$> stms) :< (hBStream <$> stms)
+    --distribute fStms = distribute (tailBS <$> fStms) :< (headBS <$> fStms)
+    distribute = ana (\fStms -> BP (tailBS <$> fStms) (headBS <$> fStms))
 
 -- Forward and backward iterate
 iterateS :: (a -> a) -> a -> Stream a
@@ -73,16 +91,21 @@ iterateS f = ana (\a -> P a (f a))
 iterateB :: (a -> a) -> a -> BStream a
 iterateB f = ana (\x -> BP (f x) x)
 
+-- List conversions
+
 toInfList :: Stream a -> [a]
 toInfList = cata (\(P a as) -> a : as)
 
+-- from stream of Maybe's (terminated by Nothing)
 stmToList :: Stream (Maybe b) -> [b]
 stmToList = fmap fromJust . takeWhile isJust . toInfList
 
+-- from stream of lists (terminated by an empty list)
 stmToMatrix :: Stream [a] -> [[a]]
 stmToMatrix = takeWhile (not . null) . toInfList
 
 -- Pointer to a location in an infinite bidirectional stream
+-- Separating current value makes this definition more symmetric
 data Cursor a = Cur { bwStm :: BStream a
                     , cur   :: a
                     , fwStm :: Stream a }
@@ -119,19 +142,18 @@ curToList (Cur _ Nothing as) = []
 curToList (Cur _ (Just a) as) = a : stmToList as
 
 listToCur :: (a -> b) -> b -> [a] -> Cursor b
-listToCur convert padding [] = Cur (pure padding) padding (pure padding)
+listToCur convert padding [] = pure padding
 listToCur convert padding (a : as) = Cur (pure padding) (convert a) (stmFromList as)
     where stmFromList = foldr ((:>) . convert) (pure padding)
 
 
-
----------------------------
--- A two-dimensional cursor, or a grid
----------------------------
+------------------------------
+-- A grid: a cursor of cursors
+------------------------------
 
 type Grid a = Compose Cursor Cursor a
 
-instance (Comonad w, Distributive w) => Comonad (Compose w w) where
+instance (Comonad w2, Comonad w1, Distributive w1) => Comonad (Compose w2 w1) where
     extract = extract . extract . getCompose
     duplicate = fmap Compose . Compose .
                 fmap distribute . duplicate . fmap duplicate .
@@ -141,13 +163,14 @@ instance {-# OVERLAPPING #-} Show a => Show (Grid a) where
   show = show . getCompose
 
 matrixToGrid :: [[a]] -> Grid (Maybe a)
-matrixToGrid ass = Compose $ listToCur id (pure Nothing) $
-                             listToCur Just Nothing <$> ass
+matrixToGrid = Compose . listToCur id (pure Nothing) .
+                         fmap (listToCur Just Nothing)
 
 gridToMatrix :: Grid (Maybe a) -> [[a]]
 gridToMatrix (Compose curcur) = stmToMatrix (a :> as)
   where (Cur _ a as) = curToList <$> curcur
 
+-- Directions: Z is stay in place
 data Dir = B | Z | F
     deriving (Eq, Enum, Bounded, Show)
 
@@ -155,10 +178,12 @@ data Dir = B | Z | F
 type Dir2 = (Dir, Dir)
 
 allDirs :: [Dir2]
-allDirs = [(F, Z), (F, F), (Z, F), (B, F), (B, Z), (B, B), (Z, B), (F, B)]
+allDirs = [(h, v) | h <- [minBound .. maxBound]
+                  , v <- [minBound .. maxBound]
+                  , (h, v) /= (Z, Z)]
 
-move :: Dir -> Cursor a -> Cursor a
-move dir =
+moveCur :: Dir -> Cursor a -> Cursor a
+moveCur dir =
     case dir of
         B -> moveBwd
         Z -> id
@@ -167,67 +192,97 @@ move dir =
 -- move all rows in the same direction
 moveH :: Dir -> Grid a -> Grid a
 moveH dir (Compose (Cur  up cur dn)) = Compose $ Cur (mv <$> up) (mv cur) (mv <$> dn)
-    where mv = move dir
+    where mv = moveCur dir
 
 move2 :: Dir2 -> Grid a -> Grid a
-move2 (h, v) = moveH h .  Compose . move v . getCompose
+move2 (h, v) = moveH h .  Compose . moveCur v . getCompose
 
-match :: Eq a => [a] -> Grid (Maybe a) -> Maybe Int
-match (a : as) grid =
+peek :: Dir2 -> Grid a -> a
+peek dir = extract . move2 dir
+
+-- First task
+
+-- return Nothing if we're starting outside of bounds
+matchesAround :: Eq a => [a] -> Grid (Maybe a) -> Maybe Int
+matchesAround (a : as) grid =
     let mx = extract grid
     in case mx of
         Nothing -> Nothing -- we're out of bounds
-        Just x ->  if x == a -- the beginning matches: check the suffix
-                   then Just $ sum $ fmap (suffix as grid) allDirs -- in all directions
-                   else Just 0 -- no local match
+        Just x | x == a -> -- local match: check the suffix in all directions
+            Just $ length $ filter (matchSuffix as grid) allDirs
+        _ -> Just 0
 
-suffix :: Eq a => [a] -> Grid (Maybe a) -> Dir2 -> Int
-suffix as grid dir =
+matchSuffix :: Eq a => [a] -> Grid (Maybe a) -> Dir2 -> Bool
+matchSuffix as grid dir =
     let grid' = move2 dir grid
-        x' = extract grid'
-        xs = fromJust <$> takeWhile isJust (walk dir x' grid')
+        mas = fmap Just as
+        mx = extract grid'
+        mxs = walkFrom grid' dir mx
     in
-        if as `isPrefixOf` xs then 1 else 0
+        mas `isPrefixOf` mxs
 
 -- walk the grid and acuumulate values
--- provide the direction and the starting value
-walk :: Dir2 -> a -> Grid a -> [a]
-walk dir a grid =  fst <$> iterate (go dir) (a, move2 dir grid)
+-- given the direction and the starting value
+walkFrom :: Grid a -> Dir2 -> a -> [a]
+walkFrom grid dir a =  fst <$> iterate (go dir) (a, move2 dir grid)
     where go :: Dir2 -> (a, Grid a) -> (a, Grid a)
           go dir (a, grid) = (extract grid, move2 dir grid)
 
-solve :: Grid (Maybe Char) -> Int
-solve grid =
-    let matches = extend (match "XMAS") grid
+solve1 :: Grid (Maybe Char) -> Int
+solve1 grid =
+    let matches = extend (matchesAround "XMAS") grid
         sums = gridToMatrix matches
     in sum $ sum <$> sums
 
+--- Second task
+
+xMas :: Grid (Maybe Char) -> Maybe Bool
+xMas grid = case extract grid of
+    Nothing  -> Nothing
+    Just 'A' -> Just $ diag grid (Just 'M', Just 'S')
+    _        -> Just False
+
+diag :: Eq a => Grid a -> (a, a) -> Bool
+diag grid p =
+    let x1 = ( peek (F, F) grid
+             , peek (B, B) grid)
+        x2 = ( peek (F, B) grid
+             , peek (B, F) grid)
+    in (p == x1 || p == swap x1) &&
+       (p == x2 || p == swap x2)
+
+solve2 :: Grid (Maybe Char) -> Int
+solve2 grid = 
+    let matches = gridToMatrix (extend xMas grid)
+    in sum $ fmap (length . filter id) matches
 
 main :: IO ()
 main = do
     txt <- readFile "data.txt"
     let grid = matrixToGrid $ lines txt
-    print $ solve grid
+    print $ solve1 grid
+    print $ solve2 grid
 
 ----------
 -- Testing
 ----------
 -- Laws
-grid = matrixToGrid [[1,2],[3,4]]
+testGrid = matrixToGrid [[1,2],[3,4]]
 instance Show a => Show (Cursor a) where
     show (Cur _ a (b :> c :> _)) = 
         show a ++ show b ++ show c ++ "\n"
 -- extract . duplicate = id
-law1 = gridToMatrix $ (extract . duplicate) grid
+law1 = gridToMatrix $ (extract . duplicate) testGrid
 
 -- fmap extract . duplicate = id
-law2 = gridToMatrix $  (fmap extract . duplicate) grid
+law2 = gridToMatrix $  (fmap extract . duplicate) testGrid
 
 -- duplicate . duplicate = fmap duplicate . duplicate
-law3 = fmap gridToMatrix <$> (duplicate . duplicate) grid
-law4 = fmap gridToMatrix <$> (fmap duplicate . duplicate) grid
+law3 = fmap gridToMatrix <$> (duplicate . duplicate) testGrid
+law4 = fmap gridToMatrix <$> (fmap duplicate . duplicate) testGrid
 
-test = solve $ matrixToGrid txt
+test1 = solve1 $ matrixToGrid txt
+test2 = solve2 $ matrixToGrid txt
 
 -- answer: XMAS 18 times
 txt :: [String]
